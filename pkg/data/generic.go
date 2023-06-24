@@ -120,6 +120,7 @@ func (s *GenericSync) RunContext(ctx context.Context) error {
 	store, queue := s.setup(ctx)
 	go func() {
 		<-ctx.Done()
+		logrus.Debug("Shutting down queue")
 		queue.ShutDown()
 	}()
 

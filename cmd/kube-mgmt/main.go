@@ -12,8 +12,11 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/signal"
 	"path"
 	"strings"
+
+	"golang.org/x/sync/errgroup"
 
 	"github.com/open-policy-agent/kube-mgmt/pkg/configmap"
 	"github.com/open-policy-agent/kube-mgmt/pkg/data"
@@ -28,27 +31,28 @@ import (
 )
 
 type params struct {
-	version            bool
-	kubeconfigFile     string
-	opaURL             string
-	opaAuth            string
-	opaAuthFile        string
-	opaCAFile          string
-	opaAllowInsecure   bool
-	policyLabel        string
-	policyValue        string
-	dataLabel          string
-	dataValue          string
-	podName            string
-	podNamespace       string
-	enablePolicies     bool
-	enableData         bool
-	namespaces         []string
-	replicateCluster   gvkFlag
-	replicateNamespace gvkFlag
-	replicatePath      string
-	logLevel           string
-	replicateIgnoreNs  []string
+	version                 bool
+	kubeconfigFile          string
+	opaURL                  string
+	opaAuth                 string
+	opaAuthFile             string
+	opaCAFile               string
+	opaAllowInsecure        bool
+	opaOutputBoostrapBundle string
+	policyLabel             string
+	policyValue             string
+	dataLabel               string
+	dataValue               string
+	podName                 string
+	podNamespace            string
+	enablePolicies          bool
+	enableData              bool
+	namespaces              []string
+	replicateCluster        gvkFlag
+	replicateNamespace      gvkFlag
+	replicatePath           string
+	logLevel                string
+	replicateIgnoreNs       []string
 }
 
 func main() {
@@ -72,7 +76,7 @@ func main() {
 		},
 	}
 
-	// Miscellaenous options.
+	// Miscellaneous options.
 	rootCmd.Flags().BoolVarP(&params.version, "version", "v", false, "print version and exit")
 	rootCmd.Flags().StringVarP(&params.kubeconfigFile, "kubeconfig", "", "", "set path to kubeconfig manually")
 	rootCmd.Flags().StringVarP(&params.opaURL, "opa-url", "", "http://localhost:8181/v1", "set URL of OPA API endpoint")
@@ -96,6 +100,9 @@ func main() {
 	rootCmd.Flags().VarP(&params.replicateCluster, "replicate-cluster", "", "replicate cluster-level resources")
 	rootCmd.Flags().StringVarP(&params.replicatePath, "replicate-path", "", "kubernetes", "set path to replicate data into")
 	rootCmd.Flags().StringSliceVarP(&params.replicateIgnoreNs, "replicate-ignore-namespaces", "", []string{""}, "namespaces that are ignored by replication")
+
+	// OPA bootstrap options.
+	rootCmd.Flags().StringVarP(&params.opaOutputBoostrapBundle, "opa-output-bootstrap-bundle", "", "", "if provided, generate a bootstrap bundle and write it to the provided path")
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if rootCmd.Flag("policy-label").Value.String() != "" || rootCmd.Flag("policy-value").Value.String() != "" {
@@ -121,7 +128,6 @@ func main() {
 }
 
 func run(params *params) {
-
 	switch params.logLevel {
 	case "debug":
 		logrus.SetLevel(logrus.DebugLevel)
@@ -132,6 +138,30 @@ func run(params *params) {
 	default:
 		logrus.Fatalf("Invalid log level %v", params.logLevel)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Listen for terminations and cancel the context.
+	signals := make(chan os.Signal)
+	signal.Notify(signals, os.Interrupt, os.Kill)
+	go func() {
+		i := 3
+
+		for sig := range signals {
+			logrus.WithField("signal", sig).Infof("Receieved signal, send %d more to force-exit", i)
+			cancel()
+			i--
+
+			if i == 0 {
+				logrus.Fatalf("Force-exiting")
+				os.Exit(1)
+				return
+			}
+		}
+	}()
+
+	group := &errgroup.Group{}
 
 	kubeconfig, err := loadRESTConfig(params.kubeconfigFile)
 	if err != nil {
@@ -164,7 +194,7 @@ func run(params *params) {
 		if rootCAs == nil {
 			rootCAs = x509.NewCertPool()
 		}
-		certs, err := ioutil.ReadFile(params.opaCAFile)
+		certs, err := os.ReadFile(params.opaCAFile)
 		if err != nil {
 			logrus.Fatalf("Failed to read opa certificate authority file %s", params.opaCAFile)
 		}
@@ -176,9 +206,18 @@ func run(params *params) {
 	}
 
 	if params.enablePolicies || params.enableData {
+		client := opa.New(params.opaURL, params.opaAuth)
+
+		if params.opaOutputBoostrapBundle != "" {
+			logrus.Infof("Running in OPA bootstrapping mode")
+			client = &opa.Bundle{
+				Path: params.opaOutputBoostrapBundle,
+			}
+		}
+
 		sync := configmap.New(
 			kubeconfig,
-			opa.New(params.opaURL, params.opaAuth),
+			client,
 			configmap.DefaultConfigMapMatcher(
 				params.namespaces,
 				params.enablePolicies,
@@ -189,10 +228,16 @@ func run(params *params) {
 				params.dataValue,
 			),
 		)
-		_, err = sync.Run(params.namespaces)
+		_, err = sync.Run(ctx, params.namespaces, params.opaOutputBoostrapBundle != "")
 		if err != nil {
 			logrus.Fatalf("Failed to start configmap sync: %v", err)
 		}
+		//return
+	}
+
+	if params.opaOutputBoostrapBundle != "" {
+		logrus.Infof("Exiting, bundle bootstrap complete")
+		return
 	}
 
 	var client dynamic.Interface
@@ -202,22 +247,29 @@ func run(params *params) {
 			logrus.Fatalf("Failed to get dynamic client: %v", err)
 		}
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	opts := data.WithIgnoreNamespaces(params.replicateIgnoreNs)
-
 	for _, gvk := range params.replicateCluster {
 		sync := data.NewFromInterface(client, opa.New(params.opaURL, params.opaAuth).Prefix(params.replicatePath), getResourceType(gvk, false), opts)
-		go sync.RunContext(ctx)
+		group.Go(func() error {
+			return sync.RunContext(ctx)
+		})
 	}
 
 	for _, gvk := range params.replicateNamespace {
 		sync := data.NewFromInterface(client, opa.New(params.opaURL, params.opaAuth).Prefix(params.replicatePath), getResourceType(gvk, true), opts)
-		go sync.RunContext(ctx)
+		group.Go(func() error {
+			return sync.RunContext(ctx)
+		})
 	}
-	quit := make(chan struct{})
-	<-quit
+
+	<-ctx.Done()
+	logrus.Infof("Context closed, waiting for program to finish")
+
+	if err := group.Wait(); err != nil {
+		logrus.WithError(err).Error("One or more syncers failed")
+	}
+
 }
 
 func loadRESTConfig(path string) (*rest.Config, error) {

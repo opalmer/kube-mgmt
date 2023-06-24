@@ -1,4 +1,4 @@
-./kube-mgmt
+kube-mgmt
 bin
 .go
 *.tgz
