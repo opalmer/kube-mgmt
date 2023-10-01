@@ -255,16 +255,25 @@ func (s *Sync) syncAdd(cm *v1.ConfigMap, isPolicy bool) {
 		var err error
 		if isPolicy {
 			err = s.opa.InsertPolicy(id, []byte(value))
-			logrus.Infof("Added policy %v, err=%v", id, err)
+			if err != nil {
+				logrus.WithError(err).Errorf("Failed to insert policy %v", id)
+			} else {
+				logrus.Infof("Inserted policy %v", id)
+			}
 		} else {
 			// We don't need to know the JSON structure, just pass it
 			// directly to the OPA data store.
 			var data map[string]interface{}
-			if err = json.Unmarshal([]byte(value), &data); err != nil {
-				logrus.Errorf("Failed to parse JSON data in configmap with id=%s", id)
+			if marshalErr := json.Unmarshal([]byte(value), &data); marshalErr != nil {
+				logrus.WithError(marshalErr).Errorf("Failed to parse JSON data in configmap with id=%s", id)
+				err = marshalErr
 			} else {
 				err = s.opa.PutData(id, data)
-				logrus.Infof("Added data %v, err=%v", id, err)
+				if err != nil {
+					logrus.WithError(err).Errorf("Failed to put data %v", id)
+				} else {
+					logrus.Infof("Put data %v", id)
+				}
 			}
 		}
 		if err != nil {

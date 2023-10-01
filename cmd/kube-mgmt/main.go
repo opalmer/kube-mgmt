@@ -9,12 +9,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
 	"path"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sync/errgroup"
 
@@ -142,9 +142,9 @@ func run(params *params) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Listen for terminations and cancel the context.
+	// Listen for terminations and cancel the context allowing for a more orderly shutdown process.
 	signals := make(chan os.Signal)
-	signal.Notify(signals, os.Interrupt, os.Kill)
+	signal.Notify(signals, os.Interrupt, os.Kill, syscall.SIGTERM)
 	go func() {
 		i := 3
 
@@ -173,9 +173,10 @@ func run(params *params) {
 	}
 
 	if params.opaAuthFile != "" {
-		file, err := ioutil.ReadFile(params.opaAuthFile)
+		file, err := os.ReadFile(params.opaAuthFile)
 		if err != nil {
 			logrus.Fatalf("Failed to read opa auth token file %s", params.opaAuthFile)
+			return
 		}
 		params.opaAuth = strings.Split(string(file), "\n")[0]
 	}
@@ -205,14 +206,19 @@ func run(params *params) {
 		http.DefaultTransport.(*http.Transport).TLSClientConfig = config
 	}
 
+	var bootstrapper *opa.BootstrapBundle
 	if params.enablePolicies || params.enableData {
 		client := opa.New(params.opaURL, params.opaAuth)
 
 		if params.opaOutputBoostrapBundle != "" {
 			logrus.Infof("Running in OPA bootstrapping mode")
-			client = &opa.Bundle{
-				Path: params.opaOutputBoostrapBundle,
+			bootstrap, err := opa.NewBootstrapBundle(params.opaOutputBoostrapBundle)
+			if err != nil {
+				logrus.WithError(err).Fatal("Failed to initialize bootstrapper")
+				return
 			}
+			client = bootstrap
+			bootstrapper = bootstrap
 		}
 
 		sync := configmap.New(
@@ -232,10 +238,16 @@ func run(params *params) {
 		if err != nil {
 			logrus.Fatalf("Failed to start configmap sync: %v", err)
 		}
-		//return
 	}
 
 	if params.opaOutputBoostrapBundle != "" {
+		if bootstrapper == nil {
+			panic("programming error: bootstrapper should have been non-nil")
+		}
+		if err := bootstrapper.Close(); err != nil {
+			logrus.WithError(err).Fatal("Error returned while closing bootstrap bundle")
+			return
+		}
 		logrus.Infof("Exiting, bundle bootstrap complete")
 		return
 	}
